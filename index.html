@@ -47,26 +47,78 @@ async function load(reply){
   return pipe;
 }
 
+const SR=16000, WIN=28, HOP=24;
+const norm = s => s.toLowerCase().replace(/[^a-z0-9']/g,"");
+
+// One full-length window starting at s (short windows break Whisper's word timing). Absolute-time words.
+async function listenAt(p, audio, s){
+  const total=audio.length/SR;
+  s=Math.max(0, Math.min(s, total-WIN));
+  const seg=audio.subarray(Math.floor(s*SR), Math.min(audio.length, Math.floor((s+WIN)*SR)));
+  const opts={return_timestamps:"word", max_new_tokens:200};          // cap runaway decoding on music
+  if(!preset.english) Object.assign(opts,{language:"english", task:"transcribe"});
+  const out=await p(seg, opts);
+  const words=[];
+  for(const c of out.chunks||[]){
+    const t0=c.timestamp&&c.timestamp[0], t1=c.timestamp&&c.timestamp[1];
+    const text=(c.text||"").trim();
+    if(!text || !isFinite(t0) || /^\[.*\]$|^\(.*\)$|^♪+$/.test(text)) continue;   // drop [Music] / ♪ tags
+    words.push({text, t:s+t0, d:Math.max(0.12,(isFinite(t1)?t1-t0:0.3))});
+  }
+  return {s, words};
+}
+
 async function transcribe(audio, reply){
   const p = await load(reply);
-  const SR=16000, WIN=28, HOP=24, EDGE=2, total=audio.length/SR;  // overlapping windows; keep each one's middle
-  const starts=[]; for(let s=0; s<total; s+=HOP){ starts.push(s); if(s+WIN>=total) break; }
-  const words=[];
+  const total=audio.length/SR;
+
+  // Pass 1: overlapping windows; each keeps the words up to the middle of its overlap with the next.
+  const starts=[]; for(let s=0;;s+=HOP){ if(s+WIN>=total){ starts.push(Math.max(0,total-WIN)); break; } starts.push(s); }
+  let words=[];
   for(let i=0;i<starts.length;i++){
-    const s=starts[i], last=i===starts.length-1;
-    const seg=audio.subarray(Math.floor(s*SR), Math.min(audio.length, Math.floor((s+WIN)*SR)));
-    reply({type:"listen", pct:Math.round(i/starts.length*100)});
-    const out=await p(seg, preset.english ? {return_timestamps:"word"}
-                                          : {return_timestamps:"word", language:"english", task:"transcribe"});
-    const lo=i? s+EDGE : 0, hi=last? Infinity : s+HOP+EDGE;
-    for(const c of out.chunks||[]){
-      const t0=c.timestamp&&c.timestamp[0], t1=c.timestamp&&c.timestamp[1];
-      const text=(c.text||"").trim(); if(!text || !isFinite(t0)) continue;
-      const t=s+t0; if(t<lo || t>=hi) continue;
-      words.push({text, t, d:Math.max(0.12,(isFinite(t1)?t1-t0:0.3))});
+    reply({type:"listen", pct:Math.round(i/starts.length*80)});
+    const {words:ws}=await listenAt(p, audio, starts[i]);
+    const lo=i? (starts[i-1]+WIN+starts[i])/2 : 0;
+    const hi=i<starts.length-1? (starts[i]+WIN+starts[i+1])/2 : Infinity;
+    words.push(...ws.filter(w=>w.t>=lo && w.t<hi));
+  }
+
+  // Pass 2: Whisper writes nothing for a window that opens with ~12s+ of instrumental, so lines after
+  // intros and breaks go missing. Re-listen to each silent gap starting just before the next heard word,
+  // walking backwards until nothing new turns up.
+  const GAP=6, LEAD=8, MAX_RETRIES=16;
+  words.sort((x,y)=>x.t-y.t);
+  const gaps=[]; let end=0;
+  for(const w of words){ if(w.t-end>GAP) gaps.push([end,w.t]); end=Math.max(end,w.t+w.d); }
+  if(total-end>GAP) gaps.push([end,total]);
+  let tries=0;
+  for(const [g0,gEnd] of gaps){
+    let g1=gEnd;
+    while(tries<MAX_RETRIES && g1-g0>2){
+      const trailing=g1>=total, start=trailing? g0 : Math.max(g0, g1-LEAD);
+      tries++;
+      reply({type:"listen", pct:Math.min(99, 80+tries*2)});
+      const {words:ws}=await listenAt(p, audio, start);
+      const found=ws.filter(w=>w.t>g0+0.2 && w.t<g1-0.2);
+      if(!found.length) break;
+      words.push(...found.map(w=>({...w, refill:true})));
+      const first=Math.min(...found.map(w=>w.t));
+      if(trailing || start<=g0 || first>=g1-0.5) break;
+      g1=first;
     }
   }
-  return words.filter(w=>!/^\[.*\]$|^\(.*\)$|^♪+$/.test(w.text));   // drop [Music] / ♪ tags
+
+  // Tidy: drop re-listened words that duplicate ones already heard, then re-seat stray short words
+  // (Whisper's timing often parks a line's first word seconds before the rest of the line).
+  words.sort((x,y)=>x.t-y.t);
+  words=words.filter(w=>!w.refill || !words.some(v=>!v.refill && norm(v.text)===norm(w.text) && Math.abs(w.t-v.t)<1));
+  for(let i=0;i<words.length;i++){
+    const w=words[i], prev=words[i-1], next=words[i+1];
+    if(next && norm(w.text).length<=4 && next.t-(w.t+w.d)>2.5 && (!prev || w.t-(prev.t+prev.d)>2.5)){
+      w.d=Math.min(w.d,0.35); w.t=next.t-w.d-0.05;
+    }
+  }
+  return words;
 }
 
 addEventListener("message", async e => {
