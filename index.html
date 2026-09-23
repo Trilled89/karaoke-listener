@@ -22,7 +22,9 @@ async function load(reply){
   try{ gpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch(e){}  // a failed attempt poisons the wasm fallback
   const files = {};
   pipe = await pipeline("automatic-speech-recognition", MODEL, {
-    dtype:"q8", device: gpu ? "webgpu" : "wasm",
+    // q8 weights produce gibberish on WebGPU; fp32 encoder + q4 decoder is the known-good GPU combo
+    dtype: gpu ? {encoder_model:"fp32", decoder_model_merged:"q4"} : "q8",
+    device: gpu ? "webgpu" : "wasm",
     progress_callback: p => {
       if(p.status==="progress" && p.total){ files[p.file]=[p.loaded,p.total];
         let L=0,T=0; for(const k in files){ L+=files[k][0]; T+=files[k][1]; }
