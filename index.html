@@ -114,7 +114,7 @@ async function transcribe(audio, reply){
   words=words.filter(w=>!w.refill || !words.some(v=>!v.refill && norm(v.text)===norm(w.text) && Math.abs(w.t-v.t)<1));
   for(let i=0;i<words.length;i++){
     const w=words[i], prev=words[i-1], next=words[i+1];
-    if(next && norm(w.text).length<=4 && next.t-(w.t+w.d)>2.5 && (!prev || w.t-(prev.t+prev.d)>2.5)){
+    if(next && norm(w.text).length<=4 && next.t-(w.t+w.d)>1.5 && (!prev || w.t-(prev.t+prev.d)>2.5)){
       w.d=Math.min(w.d,0.35); w.t=next.t-w.d-0.05;
     }
   }
