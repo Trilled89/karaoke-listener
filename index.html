@@ -12,18 +12,31 @@ It writes out song lyrics using Whisper, running entirely in your browser.</p>
 /* Neocities free sites can't fetch from other domains (CSP connect-src 'self'),
    so the karaoke page embeds this page in a hidden iframe and talks to it with postMessage. */
 const ALLOWED = ["https://brightlab.neocities.org", "http://127.0.0.1:8765", "http://localhost:8765", "http://127.0.0.1:8768"];
-const MODEL = "Xenova/whisper-base.en";
-let pipe = null, busy = false;
+// Bigger models are far better on sung vocals but only practical on a GPU; CPU-only machines use base.
+// q8 weights produce gibberish on WebGPU, so GPU presets avoid them.
+const PRESETS = {
+  base:  { model:"Xenova/whisper-base.en", english:true,
+           gpu:{encoder_model:"fp32", decoder_model_merged:"q4"}, cpu:"q8" },
+  small: { model:"onnx-community/whisper-small.en_timestamped", english:true,
+           gpu:{encoder_model:"fp32", decoder_model_merged:"q4"},
+           gpu16:{encoder_model:"fp16", decoder_model_merged:"q4"} },
+  turbo: { model:"onnx-community/whisper-large-v3-turbo_timestamped", english:false,
+           gpu:{encoder_model:"q4", decoder_model_merged:"q4"},
+           gpu16:{encoder_model:"q4f16", decoder_model_merged:"q4f16"} },
+};
+const WANT = new URLSearchParams(location.search).get("m") || "base";
+let pipe = null, preset = null, busy = false;
 
 async function load(reply){
   if(pipe) return pipe;
   const {pipeline} = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.2.4");
-  let gpu = false;                               // only try WebGPU if a real adapter exists —
-  try{ gpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch(e){}  // a failed attempt poisons the wasm fallback
+  let gpu = false, f16 = false;                  // only try WebGPU if a real adapter exists —
+  try{ const a = navigator.gpu && await navigator.gpu.requestAdapter();   // a failed attempt poisons the wasm fallback
+       gpu = !!a; f16 = !!(a && a.features.has("shader-f16")); }catch(e){}
+  preset = PRESETS[gpu && PRESETS[WANT] ? WANT : "base"];
   const files = {};
-  pipe = await pipeline("automatic-speech-recognition", MODEL, {
-    // q8 weights produce gibberish on WebGPU; fp32 encoder + q4 decoder is the known-good GPU combo
-    dtype: gpu ? {encoder_model:"fp32", decoder_model_merged:"q4"} : "q8",
+  pipe = await pipeline("automatic-speech-recognition", preset.model, {
+    dtype: !gpu ? preset.cpu : (f16 && preset.gpu16) || preset.gpu,
     device: gpu ? "webgpu" : "wasm",
     progress_callback: p => {
       if(p.status==="progress" && p.total){ files[p.file]=[p.loaded,p.total];
@@ -43,7 +56,8 @@ async function transcribe(audio, reply){
     const s=starts[i], last=i===starts.length-1;
     const seg=audio.subarray(Math.floor(s*SR), Math.min(audio.length, Math.floor((s+WIN)*SR)));
     reply({type:"listen", pct:Math.round(i/starts.length*100)});
-    const out=await p(seg,{return_timestamps:"word"});
+    const out=await p(seg, preset.english ? {return_timestamps:"word"}
+                                          : {return_timestamps:"word", language:"english", task:"transcribe"});
     const lo=i? s+EDGE : 0, hi=last? Infinity : s+HOP+EDGE;
     for(const c of out.chunks||[]){
       const t0=c.timestamp&&c.timestamp[0], t1=c.timestamp&&c.timestamp[1];
