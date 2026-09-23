@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Karaoke Listener</title>
+<meta name="description" content="Transcription helper for brightlab.neocities.org/karaoke. Runs Whisper in the browser; nothing is uploaded.">
+</head>
+<body>
+<p>This page is a behind-the-scenes helper for <a href="https://brightlab.neocities.org/karaoke">Cosmec Karaoke Lab</a>.
+It writes out song lyrics using Whisper, running entirely in your browser.</p>
+<script type="module">
+/* Neocities free sites can't fetch from other domains (CSP connect-src 'self'),
+   so the karaoke page embeds this page in a hidden iframe and talks to it with postMessage. */
+const ALLOWED = ["https://brightlab.neocities.org", "http://127.0.0.1:8765", "http://localhost:8765", "http://127.0.0.1:8768"];
+const MODEL = "Xenova/whisper-base.en";
+let pipe = null, busy = false;
+
+async function load(reply){
+  if(pipe) return pipe;
+  const {pipeline} = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.2.4");
+  let gpu = false;                               // only try WebGPU if a real adapter exists —
+  try{ gpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch(e){}  // a failed attempt poisons the wasm fallback
+  const files = {};
+  pipe = await pipeline("automatic-speech-recognition", MODEL, {
+    dtype:"q8", device: gpu ? "webgpu" : "wasm",
+    progress_callback: p => {
+      if(p.status==="progress" && p.total){ files[p.file]=[p.loaded,p.total];
+        let L=0,T=0; for(const k in files){ L+=files[k][0]; T+=files[k][1]; }
+        reply({type:"download", pct:Math.round(L/T*100)}); }
+    }
+  });
+  return pipe;
+}
+
+async function transcribe(audio, reply){
+  const p = await load(reply);
+  const SR=16000, WIN=28, HOP=24, EDGE=2, total=audio.length/SR;  // overlapping windows; keep each one's middle
+  const starts=[]; for(let s=0; s<total; s+=HOP){ starts.push(s); if(s+WIN>=total) break; }
+  const words=[];
+  for(let i=0;i<starts.length;i++){
+    const s=starts[i], last=i===starts.length-1;
+    const seg=audio.subarray(Math.floor(s*SR), Math.min(audio.length, Math.floor((s+WIN)*SR)));
+    reply({type:"listen", pct:Math.round(i/starts.length*100)});
+    const out=await p(seg,{return_timestamps:"word"});
+    const lo=i? s+EDGE : 0, hi=last? Infinity : s+HOP+EDGE;
+    for(const c of out.chunks||[]){
+      const t0=c.timestamp&&c.timestamp[0], t1=c.timestamp&&c.timestamp[1];
+      const text=(c.text||"").trim(); if(!text || !isFinite(t0)) continue;
+      const t=s+t0; if(t<lo || t>=hi) continue;
+      words.push({text, t, d:Math.max(0.12,(isFinite(t1)?t1-t0:0.3))});
+    }
+  }
+  return words.filter(w=>!/^\[.*\]$|^\(.*\)$|^♪+$/.test(w.text));   // drop [Music] / ♪ tags
+}
+
+addEventListener("message", async e => {
+  if(!ALLOWED.includes(e.origin)) return;
+  const msg=e.data||{};
+  if(msg.type!=="transcribe" || !(msg.audio instanceof Float32Array)) return;
+  const reply=m=>e.source.postMessage({...m, id:msg.id}, e.origin);
+  if(busy){ reply({type:"error", message:"busy"}); return; }
+  busy=true;
+  try{ reply({type:"result", words:await transcribe(msg.audio, reply)}); }
+  catch(err){ reply({type:"error", message:String(err&&err.message||err)}); }
+  finally{ busy=false; }
+});
+if(parent!==window) for(const o of ALLOWED) parent.postMessage({type:"ready"}, o);
+</script>
+</body>
+</html>
